@@ -1,0 +1,21 @@
+{
+  "name": "devin-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenAI-compatible local bridge to the Devin (Cognition) agent API",
+  "type": "module",
+  "bin": {
+    "devin-bridge": "bin/devin-bridge"
+  },
+  "scripts": {
+    "start": "bun src/droid-bridge.ts",
+    "check": "bun build src/droid-bridge.ts --target=bun --outdir=.build"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}
