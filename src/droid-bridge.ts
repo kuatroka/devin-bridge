@@ -9,7 +9,12 @@ const CREDENTIALS_PATH = "/Users/yo_macbook/.local/share/devin/credentials.toml"
 const DEVIN_MAX_TOKENS = 128_000;
 const FABLE_VARIANTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const HAIKU_VARIANTS = ["low", "medium", "high", "xhigh", "max"] as const;
+const OPUS_VARIANTS = ["medium", "high", "xhigh", "max"] as const;
 const SWE_2_VARIANTS = ["medium", "high", "max"] as const;
+// Devin serves no low tier for SWE-2 Flash (swe-2-flash-low is permission_denied).
+const SWE_2_FLASH_VARIANTS = ["medium", "high", "max"] as const;
+// Gemini 4 Carbon is served by Devin as one UID per effort tier.
+const GEMINI_CARBON_VARIANTS = ["low", "medium", "high"] as const;
 // DeepSeek V4.1 Flash is served directly by Devin. The 1017 uids are the
 // real Devin model identifiers; the earlier "no DeepSeek" comment was stale.
 const DEEPSEEK_IDS = [
@@ -29,11 +34,20 @@ const DEEPSEEK_DEVIN_UIDS: Record<string, string> = {
 const HAIKU_ALIASES: Record<string, string> = Object.fromEntries(
 	HAIKU_VARIANTS.map(variant => [`haiku-5-5-${variant}`, `claude-haiku-5-5-${variant}`]),
 );
+// Opus 5.5 gets the same treatment: Claude-free aliases for clients that
+// refuse to route Claude-named IDs through a custom OpenAI-compatible endpoint.
+const OPUS_ALIASES: Record<string, string> = Object.fromEntries(
+	OPUS_VARIANTS.map(variant => [`opus-5-5-${variant}`, `claude-opus-5-5-${variant}`]),
+);
+const MODEL_ALIASES: Record<string, string> = { ...HAIKU_ALIASES, ...OPUS_ALIASES };
 const MODEL_IDS = [
 	...FABLE_VARIANTS.map(variant => `claude-fable-5-1-${variant}`),
 	...HAIKU_VARIANTS.map(variant => `claude-haiku-5-5-${variant}`),
-	...Object.keys(HAIKU_ALIASES),
+	...OPUS_VARIANTS.map(variant => `claude-opus-5-5-${variant}`),
+	...Object.keys(MODEL_ALIASES),
 	...SWE_2_VARIANTS.map(variant => `swe-2-${variant}`),
+	...SWE_2_FLASH_VARIANTS.map(variant => `swe-2-flash-${variant}`),
+	...GEMINI_CARBON_VARIANTS.map(variant => `gemini-4-carbon-${variant}`),
 	...DEEPSEEK_IDS,
 ] as const;
 const ROUTER_BASE_URL = "http://127.0.0.1:20128/v1";
@@ -186,13 +200,19 @@ function toPiTools(rawTools: unknown): any[] | undefined {
 function modelFor(id: string): any {
 	return {
 		id,
-		name: id.startsWith("swe-2-")
-			? `SWE-2 ${id.split("-").at(-1)}`
+		name: id.startsWith("swe-2-flash-")
+			? `SWE-2 Flash ${id.split("-").at(-1)}`
+			: id.startsWith("swe-2-")
+				? `SWE-2 ${id.split("-").at(-1)}`
 			: id.startsWith("deepseek-")
 				? `DeepSeek V4.1 Flash${id === "deepseek-v4.1-flash" ? "" : ` ${id.split("-").at(-1)}`}`
+				: id.startsWith("gemini-4-carbon-")
+					? `Gemini 4 Carbon ${id.split("-").at(-1)}`
 				: id.startsWith("claude-haiku-5-5-")
 					? `Claude Haiku 5.5 ${id.split("-").at(-1)}`
-					: `Claude Fable 5.1 ${id.split("-").at(-1)}`,
+					: id.startsWith("claude-opus-5-5-")
+						? `Claude Opus 5.5 ${id.split("-").at(-1)}`
+						: `Claude Fable 5.1 ${id.split("-").at(-1)}`,
 		api: "devin-agent",
 		provider: "devin",
 		reasoning: true,
@@ -279,6 +299,31 @@ function completionChunks(message: any, requestedModel: string): Record<string, 
 	return chunks;
 }
 
+// Devin's upstream fails intermittently (seen 2026-11-08 as bursts of 502s).
+// Both handlers buffer the whole result before replying, so a failed attempt
+// has sent nothing yet and can be retried transparently. Errors that a retry
+// cannot fix are returned at once.
+const DEVIN_RETRY_DELAYS_MS = [2_000, 5_000, 12_000];
+const DEVIN_NON_RETRYABLE = /permission_denied|unauthenticated|invalid_argument|failed_precondition|context length|too long|exceed/i;
+
+async function devinResultWithRetry(label: string, request: Request, start: () => ReturnType<typeof streamDevin>): Promise<any> {
+	for (let attempt = 0; ; attempt++) {
+		let message: any;
+		try {
+			message = await start().result();
+		} catch (error) {
+			message = { stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) };
+		}
+		if (message.stopReason !== "error") return message;
+		const reason = message.errorMessage ?? "unknown error";
+		const delay = DEVIN_RETRY_DELAYS_MS[attempt];
+		const retry = delay !== undefined && !request.signal.aborted && !DEVIN_NON_RETRYABLE.test(reason);
+		console.error(`[${new Date().toISOString()}] devin ${label} attempt ${attempt + 1} failed: ${reason}; ${retry ? `retrying in ${delay} ms` : "giving up"}`);
+		if (!retry) return message;
+		await Bun.sleep(delay + Math.floor(Math.random() * 1_000));
+	}
+}
+
 // DeepSeek V4.1 Flash goes straight to Devin via streamDevin; the 1017 uids
 // in DEEPSEEK_DEVIN_UIDS are the real Devin model identifiers. No OpenCode
 // pass-through is needed for these ids.
@@ -288,7 +333,8 @@ async function handleDevinCompletion(request: Request, body: Record<string, any>
 		const maxTokens = Number(body.max_completion_tokens ?? body.max_tokens ?? DEVIN_MAX_TOKENS);
 		const stop = typeof body.stop === "string" ? [body.stop] : Array.isArray(body.stop) ? body.stop : undefined;
 		const devinUid = DEEPSEEK_DEVIN_UIDS[modelId] ?? modelId;
-		const stream = streamDevin(modelFor(modelId), { systemPrompt: converted.systemPrompt, messages: converted.messages, tools: toPiTools(body.tools) }, {
+		const context = { systemPrompt: converted.systemPrompt, messages: converted.messages, tools: toPiTools(body.tools) };
+		const options = {
 			apiKey: readToken(),
 			baseUrl: DEVIN_BASE_URL,
 			maxTokens: Number.isFinite(maxTokens) ? Math.min(Math.max(1, maxTokens), DEVIN_MAX_TOKENS) : DEVIN_MAX_TOKENS,
@@ -297,8 +343,8 @@ async function handleDevinCompletion(request: Request, body: Record<string, any>
 			stopSequences: stop,
 			sessionId: request.headers.get("x-session-id") ?? body.user ?? crypto.randomUUID(),
 			chatModelUid: devinUid,
-		} as any);
-		const message = await stream.result();
+		} as any;
+		const message = await devinResultWithRetry(modelId, request, () => streamDevin(modelFor(modelId), context, options));
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			return Response.json({ error: { message: message.errorMessage ?? "Devin request failed", type: "server_error" } }, { status: 502 });
 		}
@@ -309,6 +355,91 @@ async function handleDevinCompletion(request: Request, body: Record<string, any>
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return Response.json({ error: { message, type: "server_error" } }, { status: 502 });
+	}
+}
+
+// Optional reroute of Devin DeepSeek IDs to ENGY (same DeepSeek V4.1 Flash weights).
+// Enabled only while ENGY_OVERRIDE_FILE exists; it maps Devin model IDs to
+// { model, reasoning_effort }. The ENGY key is read from Droid's settings at
+// request time so it is never copied anywhere else.
+const ENGY_OVERRIDE_FILE = `${process.env.HOME}/.config/devin-bridge/engy-override.json`;
+const ENGY_BASE_URL = "https://api.engy.ai/v1";
+
+function engyOverride(modelId: string): { model: string; reasoning_effort?: string } | undefined {
+	try {
+		const map = JSON.parse(readFileSync(ENGY_OVERRIDE_FILE, "utf8")) as Record<string, { model: string; reasoning_effort?: string }>;
+		return map[modelId];
+	} catch {
+		return undefined;
+	}
+}
+
+// On this network, the 188.114.96.x/97.x Cloudflare IPs that most resolvers
+// return for api.engy.ai time out, while other Cloudflare edge IPs work
+// (seen 2026-11-08). Probe candidates and pin the first that answers,
+// keeping SNI and Host as api.engy.ai.
+const ENGY_FALLBACK_IPS = ["172.67.199.86", "104.21.21.157"];
+let engyIp: { ip: string; at: number } | undefined;
+async function engyAddress(): Promise<string> {
+	if (engyIp && Date.now() - engyIp.at < 10 * 60_000) return engyIp.ip;
+	const dig = Bun.spawnSync(["/usr/bin/dig", "+short", "+time=2", "+tries=1", "api.engy.ai"]).stdout.toString()
+		.split("\n").map(l => l.trim()).filter(l => /^\d+\.\d+\.\d+\.\d+$/.test(l));
+	const candidates = [...new Set([...dig, ...ENGY_FALLBACK_IPS])];
+	for (const ip of candidates) {
+		try {
+			const r = await fetch(`https://${ip}/v1/models`, { headers: { host: "api.engy.ai" }, tls: { serverName: "api.engy.ai" }, signal: AbortSignal.timeout(4000) } as any);
+			if (r.status < 500) {
+				engyIp = { ip, at: Date.now() };
+				return ip;
+			}
+		} catch {}
+	}
+	throw new Error(`No reachable api.engy.ai address among ${candidates.join(", ")}`);
+}
+
+function engyKey(): string {
+	const settings = JSON.parse(readFileSync(`${process.env.HOME}/.factory/settings.json`, "utf8"));
+	const entry = (settings.customModels ?? []).find((m: any) => typeof m.baseUrl === "string" && m.baseUrl.startsWith(ENGY_BASE_URL) && m.apiKey);
+	if (!entry) throw new Error("No ENGY apiKey found in ~/.factory/settings.json");
+	return entry.apiKey;
+}
+
+async function handleEngyCompletion(request: Request, body: Record<string, any>, target: { model: string; reasoning_effort?: string }): Promise<Response> {
+	const forwarded = { ...body, model: target.model, ...(target.reasoning_effort ? { reasoning_effort: target.reasoning_effort } : {}) };
+	const delays = [2000, 5000, 12000];
+	for (let attempt = 0; ; attempt++) {
+		try {
+			const upstream = await fetch(`https://${await engyAddress()}/v1/chat/completions`, {
+				method: "POST",
+				headers: { host: "api.engy.ai", "content-type": "application/json", authorization: `Bearer ${engyKey()}` },
+				tls: { serverName: "api.engy.ai" },
+				body: JSON.stringify(forwarded),
+				signal: request.signal,
+			} as any);
+			if (upstream.ok || attempt >= delays.length || ![429, 500, 502, 503, 504].includes(upstream.status)) {
+				if (!upstream.ok) console.error(`[${new Date().toISOString()}] engy ${target.model} HTTP ${upstream.status}: ${(await upstream.clone().text()).slice(0, 300)}`);
+				// Debug tap: keep the last request and log each stream's tail so mid-stream errors are visible.
+				const reqId = `${Date.now()}`;
+				try { await Bun.write(`/tmp/bridge-engy-req-${reqId % 4}.json`, JSON.stringify(forwarded)); } catch {}
+				const [toClient, toLog] = upstream.body ? upstream.body.tee() : [null, null];
+				if (toLog) (async () => {
+					const text = await new Response(toLog).text();
+					const bad = /"error"|\berror\b/i.test(text.slice(-4000)) || !text.includes("[DONE]");
+					console.error(`[${new Date().toISOString()}] engy stream ${reqId % 4} ${text.length}B done=${text.includes("[DONE]")}${bad ? " TAIL=" + JSON.stringify(text.slice(-600)) : ""}`);
+				})().catch(e => console.error(`[${new Date().toISOString()}] engy stream ${reqId % 4} read error: ${e}`));
+				return new Response(toClient, { status: upstream.status, headers: { "content-type": upstream.headers.get("content-type") ?? "application/json", "cache-control": "no-cache" } });
+			}
+			console.error(`[${new Date().toISOString()}] engy ${target.model} attempt ${attempt + 1} HTTP ${upstream.status}; retrying`);
+		} catch (error) {
+			engyIp = undefined;
+			if (request.signal.aborted || attempt >= delays.length) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(`[${new Date().toISOString()}] engy ${target.model} failed: ${message}`);
+				return Response.json({ error: { message, type: "server_error" } }, { status: 502 });
+			}
+			console.error(`[${new Date().toISOString()}] engy ${target.model} attempt ${attempt + 1} error: ${error instanceof Error ? error.message : String(error)}; retrying`);
+		}
+		await Bun.sleep(delays[attempt]);
 	}
 }
 
@@ -323,11 +454,13 @@ async function handleCompletion(request: Request): Promise<Response> {
 	const bareModelId = requestedModel
 		.replace(/^dv\//, "")
 		.replace(/^devin-fable-5-1-/, "claude-fable-5-1-");
-	// Devin only exposes effort-suffixed Haiku IDs. Keep the old bare ID working
-	// for existing clients by defaulting it to medium.
+	// Devin only exposes effort-suffixed Haiku/Opus IDs. Keep the old bare ID
+	// working for existing clients by defaulting it to medium.
 	const modelId = bareModelId === "claude-haiku-5-5"
 		? "claude-haiku-5-5-medium"
-		: HAIKU_ALIASES[bareModelId] ?? bareModelId;
+		: MODEL_ALIASES[bareModelId] ?? bareModelId;
+	const engy = engyOverride(modelId);
+	if (engy) return handleEngyCompletion(request, body, engy);
 	if (modelId in DEEPSEEK_DEVIN_UIDS) return handleDevinCompletion(request, body, requestedModel, modelId);
 	if (!MODEL_IDS.includes(modelId as typeof MODEL_IDS[number])) {
 		return Response.json({ error: { message: `Unsupported Devin model: ${requestedModel}`, type: "invalid_request_error" } }, { status: 400 });
@@ -336,7 +469,8 @@ async function handleCompletion(request: Request): Promise<Response> {
 		const converted = toPiMessages(Array.isArray(body.messages) ? body.messages : [], modelId);
 		const maxTokens = Number(body.max_completion_tokens ?? body.max_tokens ?? DEVIN_MAX_TOKENS);
 		const stop = typeof body.stop === "string" ? [body.stop] : Array.isArray(body.stop) ? body.stop : undefined;
-		const stream = streamDevin(modelFor(modelId), { systemPrompt: converted.systemPrompt, messages: converted.messages, tools: toPiTools(body.tools) }, {
+		const context = { systemPrompt: converted.systemPrompt, messages: converted.messages, tools: toPiTools(body.tools) };
+		const options = {
 			apiKey: readToken(),
 			baseUrl: DEVIN_BASE_URL,
 			maxTokens: Number.isFinite(maxTokens) ? Math.min(Math.max(1, maxTokens), DEVIN_MAX_TOKENS) : DEVIN_MAX_TOKENS,
@@ -344,8 +478,8 @@ async function handleCompletion(request: Request): Promise<Response> {
 			topP: typeof body.top_p === "number" ? body.top_p : 1,
 			stopSequences: stop,
 			sessionId: request.headers.get("x-session-id") ?? body.user ?? crypto.randomUUID(),
-		} as any);
-		const message = await stream.result();
+		} as any;
+		const message = await devinResultWithRetry(modelId, request, () => streamDevin(modelFor(modelId), context, options));
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			return Response.json({ error: { message: message.errorMessage ?? "Devin request failed", type: "server_error" } }, { status: 502 });
 		}
@@ -362,13 +496,20 @@ async function handleCompletion(request: Request): Promise<Response> {
 const server = Bun.serve({
 	hostname: HOST,
 	port: PORT,
+	// ENGY max-effort turns can stay silent for long stretches; Bun's 10 s default drops them.
+	idleTimeout: 255,
 	async fetch(request) {
 		const url = new URL(request.url);
 		if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "*", "access-control-allow-methods": "GET,POST,OPTIONS" } });
 		if (request.method === "GET" && url.pathname.endsWith("/models")) {
 			return Response.json({ object: "list", data: MODEL_IDS.map(model => ({ id: `dv/${model}`, object: "model", created: 0, owned_by: "devin" })) });
 		}
-		if (request.method === "POST" && url.pathname.endsWith("/chat/completions")) return handleCompletion(request);
+		if (request.method === "POST" && url.pathname.endsWith("/chat/completions")) {
+			const t0 = Date.now();
+			const res = await handleCompletion(request);
+			console.error(`[${new Date().toISOString()}] access ${request.headers.get("content-length") ?? "?"}B -> ${res.status} in ${Date.now() - t0}ms`);
+			return res;
+		}
 		return Response.json({ error: { message: "Not found", type: "invalid_request_error" } }, { status: 404 });
 	},
 });

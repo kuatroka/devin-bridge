@@ -21,12 +21,21 @@ Connect/protobuf protocol directly; it does not shell out to the `devin` CLI.
 | Fable 5.1 | `claude-fable-5-1-{low,medium,high,xhigh,max}` | `claude-fable-5-1-*` |
 | Haiku 5.5 | `claude-haiku-5-5-{low,medium,high,xhigh,max}` | `claude-haiku-5-5-*` |
 | Haiku 5.5 alias | `haiku-5-5-{low,medium,high,xhigh,max}` | same upstream as above |
+| Opus 5.5 | `claude-opus-5-5-{medium,high,xhigh,max}` | `claude-opus-5-5-*` |
+| Opus 5.5 alias | `opus-5-5-{medium,high,xhigh,max}` | same upstream as above |
 | SWE-2 | `swe-2-{medium,high,max}` | `swe-2-*` |
+| SWE-2 Flash | `swe-2-flash-{medium,high,max}` | same |
+| Gemini 4 Carbon | `gemini-4-carbon-{low,medium,high}` | same |
 | DeepSeek V4.1 Flash | `deepseek-v4.1-flash`, `-none`, `-high`, `-max` | `deepseek-v4-1-flash-1017-*` |
 
-The `haiku-5-5-*` aliases exist because some clients (Amp) refuse to route
-Claude-named model IDs through a custom OpenAI-compatible endpoint. They select
-the same upstream Haiku 5.5 model as the `claude-haiku-5-5-*` IDs.
+The `haiku-5-5-*` and `opus-5-5-*` aliases exist because some clients (Amp)
+refuse to route Claude-named model IDs through a custom OpenAI-compatible
+endpoint. They select the same upstream model as the corresponding
+`claude-*` IDs.
+
+The bridge forwards the requested ID as Devin's `chatModelUid`, so any model
+listed by Devin's `GetCliModelConfigs` can be served by adding it to
+`MODEL_IDS` — no other wiring is needed.
 
 ## Configuration
 

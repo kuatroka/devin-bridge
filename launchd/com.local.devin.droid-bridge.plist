@@ -9,16 +9,15 @@
         <string>/opt/homebrew/bin/bun</string>
         <string>/Users/yo_macbook/Documents/dev/devin-bridge/src/droid-bridge.ts</string>
     </array>
-    <key>WorkingDirectory</key>
-    <string>/Users/yo_macbook/Documents/dev/devin-bridge</string>
+    <!-- No WorkingDirectory (launchd cannot chdir into ~/Documents; TCC blocks
+         it) and no ProcessType (Background wedges the job in xpcproxy). Both
+         leave the service spinning without ever exec'ing bun. -->
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>
     <integer>5</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
     <key>StandardOutPath</key>
     <string>/tmp/devin-droid-bridge.log</string>
     <key>StandardErrorPath</key>
